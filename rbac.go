@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"github.com/fluxxu/util"
+	"github.com/lann/squirrel"
 	"time"
 )
 
@@ -12,7 +13,8 @@ const MaxCheckRecursionLevel int = 3
 type ItemType int
 
 const (
-	TypeRole ItemType = iota
+	TypeAny ItemType = iota
+	TypeRole
 	TypeTask
 	TypeOperation
 )
@@ -128,4 +130,125 @@ func CheckAccess(item string, userId string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func Query(t ItemType, userId string) ([]string, error) {
+	rv := []string{}
+	q := squirrel.Select("rbacitem.name").From("rbacassignment").Join("rbacitem ON rbacitem.name = rbacassignment.item_name")
+	if t != TypeAny {
+		q = q.Where("rbacitem.type = ?", t)
+	}
+	q = q.Where("rbacassignment.user_id = ?", userId)
+	sql, args, err := q.ToSql()
+	if err != nil {
+		return nil, err
+	}
+
+	if err = dbx.Select(&rv, sql, args...); err != nil {
+		return nil, err
+	}
+	return rv, nil
+}
+
+func BatchQuery(t ItemType, userIdSet []string) ([][]string, error) {
+	count := len(userIdSet)
+	if count == 0 {
+		return [][]string{}, nil
+	}
+
+	iMap := make(map[string]int)
+	for index, user := range userIdSet {
+		iMap[user] = index
+	}
+	rv := make([][]string, count)
+
+	q := squirrel.Select("rbacassignment.user_id, rbacitem.name").From("rbacassignment").Join("rbacitem ON rbacitem.name = rbacassignment.item_name")
+	if t != TypeAny {
+		q = q.Where("rbacitem.type = ?", t)
+	}
+	q = q.Where(squirrel.Eq{"rbacassignment.user_id": userIdSet})
+	rows, err := q.RunWith(dbx.DB).Query()
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var user string
+		var role string
+		if err = rows.Scan(&user, &role); err != nil {
+			return nil, err
+		}
+		index := iMap[user]
+		rv[index] = append(rv[index], role)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	return rv, nil
+}
+
+func Sync(userId string, items []string) error {
+	existing := []string{}
+	if err := dbx.Select(&existing, "SELECT item_name FROM rbacassignment WHERE user_id = ?", userId); err != nil {
+		return err
+	}
+
+	removeList := []string{}
+	insertList := []string{}
+
+	for _, existingItem := range existing {
+		if util.IndexOfString(items, existingItem) == -1 {
+			removeList = append(removeList, existingItem)
+		}
+	}
+
+	for _, item := range items {
+		if util.IndexOfString(existing, item) == -1 {
+			insertList = append(insertList, item)
+		}
+	}
+
+	if len(removeList) > 0 || len(insertList) > 0 {
+		tx, err := dbx.Begin()
+		if err != nil {
+			return err
+		}
+
+		rollback := func(err error) error {
+			if txerr := tx.Rollback(); txerr != nil {
+				return fmt.Errorf("%s; %s", err.Error(), txerr.Error())
+			}
+			return err
+		}
+
+		if len(removeList) > 0 {
+			q := squirrel.Delete("rbacassignment").Where("user_id = ?", userId).Where(squirrel.Eq{"item_name": removeList})
+			sql, args, err := q.ToSql()
+			if err != nil {
+				return rollback(err)
+			}
+
+			if _, err = tx.Exec(sql, args...); err != nil {
+				return rollback(err)
+			}
+		}
+
+		if len(insertList) > 0 {
+			q := squirrel.Insert("rbacassignment").Columns("item_name", "user_id", "created_at")
+			for _, item := range insertList {
+				q = q.Values(item, userId, time.Now())
+			}
+			sql, args, err := q.ToSql()
+			if err != nil {
+				return rollback(err)
+			}
+
+			if _, err = tx.Exec(sql, args...); err != nil {
+				return rollback(err)
+			}
+		}
+
+		return tx.Commit()
+	}
+	return nil
 }
